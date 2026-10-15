@@ -1,27 +1,68 @@
-from django.http import JsonResponse
+import fnmatch
+import importlib
+import io
+import json
+import logging
+import re
+
 from django.conf import settings
 from django.contrib import messages
+from django.http import JsonResponse
 from django.shortcuts import redirect
-from django.urls import resolve, Resolver404
-import re
-import logging
-import fnmatch
-import json
-import io
-import importlib
-
+from django.urls import resolve
 
 logger = logging.getLogger(__name__)
 
 
+def _unwrap_choice_value(value):
+    """
+    NetBox 4.7 returns selection / multiple-selection custom field values as
+    {"value": <raw>, "label": <display>} in the REST and GraphQL APIs.
+    Writes still accept the raw value.
+    """
+    if isinstance(value, dict) and "value" in value:
+        return value["value"]
+    if isinstance(value, (list, tuple)):
+        return [_unwrap_choice_value(v) for v in value]
+    return value
+
+
+def _custom_field_values(obj):
+    """
+    Return an object's custom field values as a {name: value} mapping.
+
+    NetBox <= 4.6 exposed ``obj.custom_fields`` as a dict of values. As of
+    NetBox 4.7 ``CustomFieldsMixin.custom_fields`` and
+    ``CustomField.objects.get_for_model()`` return lists, and fields awaiting a
+    background bulk update are omitted entirely - so fall back to the raw
+    ``custom_field_data`` JSON column.
+    """
+    cf = getattr(obj, "custom_fields", None)
+    if isinstance(cf, dict):
+        return cf
+
+    data = getattr(obj, "custom_field_data", None)
+    if isinstance(data, dict):
+        return data
+
+    values = {}
+    if isinstance(cf, (list, tuple)):
+        for item in cf:
+            if isinstance(item, dict) and "name" in item:
+                values[item["name"]] = item.get("value")
+            elif isinstance(item, (list, tuple)) and len(item) == 2:
+                values[item[0]] = item[1]
+    return values
+
+
 def _is_field_changed(obj, field, submitted_value):
     # Get current value from database object
-    attname = getattr(field, 'attname', field.name)
+    attname = getattr(field, "attname", field.name)
     current_val = getattr(obj, attname, getattr(obj, field.name, None))
-    
+
     # Check if field is m2m or current_val is a relation manager (e.g., tags)
-    is_m2m = hasattr(current_val, 'all') or getattr(field, 'many_to_many', False)
-    
+    is_m2m = hasattr(current_val, "all") or getattr(field, "many_to_many", False)
+
     if is_m2m:
         if submitted_value is None or submitted_value == "" or submitted_value == []:
             sub_list = []
@@ -29,25 +70,30 @@ def _is_field_changed(obj, field, submitted_value):
             sub_list = [str(v) for v in submitted_value if v is not None and v != ""]
         else:
             sub_list = [str(submitted_value)]
-            
-        if hasattr(current_val, 'all'):
-            curr_list = [str(pk) for pk in current_val.values_list('pk', flat=True)]
+
+        if hasattr(current_val, "all"):
+            curr_list = [str(pk) for pk in current_val.values_list("pk", flat=True)]
         elif isinstance(current_val, (list, tuple)):
             curr_list = [str(v) for v in current_val if v is not None and v != ""]
         else:
             curr_list = [str(current_val)] if current_val is not None else []
-            
+
         return sorted(sub_list) != sorted(curr_list)
 
     # If current_val is a relation, get its pk
-    if hasattr(current_val, 'pk'):
+    if hasattr(current_val, "pk"):
         current_val = current_val.pk
-        
+
     # Coerce/normalize submitted_value
     # If it's a dict (nested serializer), extract 'id' or 'pk'
     if isinstance(submitted_value, dict):
-        submitted_value = submitted_value.get('id', submitted_value.get('pk', submitted_value))
-    
+        submitted_value = submitted_value.get(
+            "id", submitted_value.get("pk", submitted_value)
+        )
+
+    # NetBox 4.7: selection custom fields arrive as {"value": ..., "label": ...}
+    submitted_value = _unwrap_choice_value(submitted_value)
+
     # If it's a list/tuple (e.g. choices or multiselect), normalize it
     if isinstance(submitted_value, (list, tuple)):
         sub_list = sorted([str(v) for v in submitted_value])
@@ -68,7 +114,16 @@ def _is_field_changed(obj, field, submitted_value):
 
     return normalize(current_val) != normalize(submitted_value)
 
+
 WRITE_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
+
+# NetBox 4.7 replaced the legacy protocol/ports pair on ipam.Service and
+# ipam.ServiceTemplate with a unified port_mappings field. The legacy names
+# are accepted on REST write but no longer exist at the ORM level.
+FIELD_ALIASES = {
+    "protocol": "port_mappings",
+    "ports": "port_mappings",
+}
 
 LEVEL_PRIORITY = {
     "debug": 10,
@@ -85,7 +140,6 @@ class NetboxLogger:
         self.enable_logging = enable_logging
         self.log_level = log_level
 
-
     def log(self, level, message, display=None):
         log_level = level.lower()
 
@@ -99,19 +153,18 @@ class NetboxLogger:
 
             # Always log using the MIN level, not the original log_level
             log_msg_map = {
-                    "debug": logger.debug,
-                    "info": logger.info,
-                    "success": logger.info,              # no native success level
-                    "warning": logger.warning,
-                    "error": logger.error,
+                "debug": logger.debug,
+                "info": logger.info,
+                "success": logger.info,  # no native success level
+                "warning": logger.warning,
+                "error": logger.error,
             }
 
             # Output the log message using the higest log level value
-            if (current_priority >= min_priority):
+            if current_priority >= min_priority:
                 log_msg_map.get(log_level, logger.error)(log_msg)
             else:
                 log_msg_map.get(self.log_level, logger.error)(log_msg)
-
 
         # --- UI Messages ---
         if self.request is not None and log_level != "debug":
@@ -120,7 +173,6 @@ class NetboxLogger:
             # strip off the [BranchGuard.*] string on the display message
             if ui_msg.startswith("[BranchGuard"):
                 ui_msg = re.sub(r"^\[BranchGuard[^\]]*\]\s*", "", ui_msg)
-
 
             # Always log using the MIN level, not the original log_level
             ui_msg_map = {
@@ -132,10 +184,8 @@ class NetboxLogger:
             }
 
             # Output the UI message using the higest log level value
-            if (current_priority >= min_priority):
+            if current_priority >= min_priority:
                 ui_msg_map.get(log_level, messages.error)(self.request, ui_msg)
-
-        return
 
     # Optional helpers (recommended)
     def debug(self, message, display=None):
@@ -154,15 +204,11 @@ class NetboxLogger:
         self.log("error", message, display)
 
 
-
 class NetboxBranchGuardMiddleware:
-
     def __init__(self, get_response):
         self.get_response = get_response
 
-        plugin_config = settings.PLUGINS_CONFIG.get(
-            "netbox_branch_guard", {}
-        )
+        plugin_config = settings.PLUGINS_CONFIG.get("netbox_branch_guard", {})
 
         self.enabled = plugin_config.get("enabled", True)
         self.api_bypass = plugin_config.get("api_bypass", True)
@@ -171,8 +217,12 @@ class NetboxBranchGuardMiddleware:
         self.logging = plugin_config.get("logging", False)
         self.log_level = plugin_config.get("log_level", "warning").lower()
         self.group_branch_map = plugin_config.get("group_branch_map", {})
-        self.excluded_models = {m.lower() for m in plugin_config.get("excluded_models", [])}
-        self.excluded_fields = {f.lower() for f in plugin_config.get("excluded_fields", [])}
+        self.excluded_models = {
+            m.lower() for m in plugin_config.get("excluded_models", [])
+        }
+        self.excluded_fields = {
+            f.lower() for f in plugin_config.get("excluded_fields", [])
+        }
         self.view_model_map = plugin_config.get("view_model_map", {})
 
         valid_levels = {"debug", "info", "success", "warning", "error"}
@@ -195,12 +245,12 @@ class NetboxBranchGuardMiddleware:
             f"view_model_map: {self.view_model_map} "
         )
 
-
-
     def __call__(self, request):
 
         # Enable logging
-        log = NetboxLogger(request, enable_logging=self.logging, log_level=self.log_level)
+        log = NetboxLogger(
+            request, enable_logging=self.logging, log_level=self.log_level
+        )
 
         # Verify the request data
         log.debug(f"[BranchGuard REQUEST] {request} ")
@@ -239,7 +289,6 @@ class NetboxBranchGuardMiddleware:
             # Allow superuser bypass
             if self.superuser_bypass and request.user.is_superuser:
                 return self.get_response(request)
-
 
             # --- Resolve branch ID (API + UI safe) ---
             branch_id = None
@@ -292,13 +341,15 @@ class NetboxBranchGuardMiddleware:
 
                 if resolver_match:
                     view_func = resolver_match.func
-                    view_class = getattr(view_func, 'view_class', getattr(view_func, 'cls', None))
+                    view_class = getattr(
+                        view_func, "view_class", getattr(view_func, "cls", None)
+                    )
                     if view_class:
-                        queryset = getattr(view_class, 'queryset', None)
-                        if queryset is not None and hasattr(queryset, 'model'):
+                        queryset = getattr(view_class, "queryset", None)
+                        if queryset is not None and hasattr(queryset, "model"):
                             model = queryset.model
                         else:
-                            model = getattr(view_class, 'model', None)
+                            model = getattr(view_class, "model", None)
 
                     log.debug(
                         f"[BranchGuard DEBUG] "
@@ -316,15 +367,12 @@ class NetboxBranchGuardMiddleware:
 
                     # If we can't determine the model, then see if there is a mapping in the view_model_map
                     if model is None and view_class:
-                        view_name = (
-                            f"{view_class.__module__}."
-                            f"{view_class.__name__}"
-                        )
+                        view_name = f"{view_class.__module__}.{view_class.__name__}"
 
                         mapped_model = self.view_model_map.get(view_name)
 
                         if mapped_model:
-                            module_name, class_name = mapped_model.rsplit('.', 1)
+                            module_name, class_name = mapped_model.rsplit(".", 1)
                             module = importlib.import_module(module_name)
                             model = getattr(module, class_name)
 
@@ -339,15 +387,12 @@ class NetboxBranchGuardMiddleware:
                 else:
                     block_reasons.append("Could not resolve path to a view")
 
-
                 # 1. Check if model itself is exempt
                 model_exempt = False
                 if model:
                     model_label = model._meta.label_lower
 
-                    model_path = (
-                        f"{model.__module__}.{model.__name__}"
-                    ).lower()
+                    model_path = (f"{model.__module__}.{model.__name__}").lower()
 
                     log.debug(
                         f"[BranchGuard DEBUG] "
@@ -355,7 +400,11 @@ class NetboxBranchGuardMiddleware:
                         f"model_path={model_path} "
                     )
 
-                    if model_label in self.excluded_models or model_path in self.excluded_models or model._meta.app_label == 'netbox_branching':
+                    if (
+                        model_label in self.excluded_models
+                        or model_path in self.excluded_models
+                        or model._meta.app_label == "netbox_branching"
+                    ):
                         model_exempt = True
                 else:
                     block_reasons.append("No model resolved for path")
@@ -369,15 +418,22 @@ class NetboxBranchGuardMiddleware:
                     if self.excluded_fields:
                         # Get submitted data
                         submitted_data = {}
-                        if request.content_type == "application/json" or request.path_info.startswith("/api/"):
+                        if (
+                            request.content_type == "application/json"
+                            or request.path_info.startswith("/api/")
+                        ):
                             try:
                                 body = request.body
                                 request._body = body
                                 request._stream = io.BytesIO(body)
                                 submitted_data = json.loads(body)
                             except Exception as e:
-                                block_reasons.append(f"JSON body parse failed: {e}")
-                                log.warning(f"[BranchGuard BLOCK] JSON body parse failed: {e}")
+                                log.warning(
+                                    f"[BranchGuard BLOCK] JSON body parse failed: {e}"
+                                )
+                                # Defer to NetBox's own validation so API clients get
+                                # the 4.7 structured error format rather than our redirect
+                                return self.get_response(request)
                         else:
                             submitted_data = request.POST.dict()
 
@@ -387,7 +443,9 @@ class NetboxBranchGuardMiddleware:
                         if pk:
                             pks = [pk]
                         else:
-                            pk_list = submitted_data.get('pk') or submitted_data.get('id')
+                            pk_list = submitted_data.get("pk") or submitted_data.get(
+                                "id"
+                            )
                             if pk_list:
                                 if isinstance(pk_list, list):
                                     pks = pk_list
@@ -405,7 +463,7 @@ class NetboxBranchGuardMiddleware:
                             if objs:
                                 # Compare changes
                                 non_exempt_changes = False
-                                
+
                                 # Gather all fields (concrete and m2m)
                                 all_fields = {f.name: f for f in model._meta.fields}
                                 for m2m in model._meta.many_to_many:
@@ -413,22 +471,32 @@ class NetboxBranchGuardMiddleware:
 
                                 # Check each field in submitted data
                                 for field_name, val in submitted_data.items():
-                                    if field_name.startswith('cf_'):
+                                    if field_name.startswith("cf_"):
                                         cf_name = field_name[3:]
-                                        if field_name.lower() in self.excluded_fields or cf_name.lower() in self.excluded_fields or 'custom_fields' in self.excluded_fields:
+                                        if (
+                                            field_name.lower() in self.excluded_fields
+                                            or cf_name.lower() in self.excluded_fields
+                                            or "custom_fields" in self.excluded_fields
+                                        ):
                                             continue
-                                        
+
                                         for obj in objs:
-                                            current_cf_val = obj.custom_fields.get(cf_name) if hasattr(obj, 'custom_fields') and isinstance(obj.custom_fields, dict) else None
-                                            
+                                            current_cf_val = _unwrap_choice_value(
+                                                _custom_field_values(obj).get(cf_name)
+                                            )
+
                                             def normalize_cf(v):
                                                 if v is None or v == "" or v is False:
                                                     return ""
                                                 if v is True:
                                                     return "true"
                                                 return str(v).strip().lower()
-                                                
-                                            if normalize_cf(current_cf_val) != normalize_cf(val):
+
+                                            if normalize_cf(
+                                                current_cf_val
+                                            ) != normalize_cf(
+                                                _unwrap_choice_value(val)
+                                            ):
                                                 non_exempt_changes = True
                                                 msg = f"Custom field '{cf_name}' changed (old: {current_cf_val}, new: {val})"
                                                 block_reasons.append(msg)
@@ -439,30 +507,66 @@ class NetboxBranchGuardMiddleware:
                                         field = all_fields.get(field_name)
                                         if not field:
                                             # Might be using attname (e.g. tenant_id instead of tenant)
-                                            field = next((f for f in model._meta.fields if f.attname == field_name), None)
+                                            field = next(
+                                                (
+                                                    f
+                                                    for f in model._meta.fields
+                                                    if f.attname == field_name
+                                                ),
+                                                None,
+                                            )
+                                        if not field:
+                                            # NetBox 4.7 legacy alias (protocol/ports -> port_mappings)
+                                            field = all_fields.get(
+                                                FIELD_ALIASES.get(field_name.lower())
+                                            )
 
                                         if field:
-                                            if field_name == 'custom_fields' and isinstance(val, dict):
+                                            if (
+                                                field_name == "custom_fields"
+                                                and isinstance(val, dict)
+                                            ):
                                                 # Custom fields in API
                                                 for obj in objs:
-                                                    current_cf = getattr(obj, 'custom_fields', {}) or {}
-                                                    if not isinstance(current_cf, dict):
-                                                        current_cf = {}
-                                                    
+                                                    current_cf = _custom_field_values(
+                                                        obj
+                                                    )
+
                                                     for cf_key, cf_val in val.items():
-                                                        if cf_key.lower() in self.excluded_fields or f"cf_{cf_key}".lower() in self.excluded_fields or 'custom_fields' in self.excluded_fields:
+                                                        if (
+                                                            cf_key.lower()
+                                                            in self.excluded_fields
+                                                            or f"cf_{cf_key}".lower()
+                                                            in self.excluded_fields
+                                                            or "custom_fields"
+                                                            in self.excluded_fields
+                                                        ):
                                                             continue
-                                                        
-                                                        current_cf_val = current_cf.get(cf_key)
-                                                        
+
+                                                        current_cf_val = (
+                                                            _unwrap_choice_value(
+                                                                current_cf.get(cf_key)
+                                                            )
+                                                        )
+
                                                         def normalize_cf(v):
-                                                            if v is None or v == "" or v is False:
+                                                            if (
+                                                                v is None
+                                                                or v == ""
+                                                                or v is False
+                                                            ):
                                                                 return ""
                                                             if v is True:
                                                                 return "true"
-                                                            return str(v).strip().lower()
-                                                            
-                                                        if normalize_cf(current_cf_val) != normalize_cf(cf_val):
+                                                            return (
+                                                                str(v).strip().lower()
+                                                            )
+
+                                                        if normalize_cf(
+                                                            current_cf_val
+                                                        ) != normalize_cf(
+                                                            _unwrap_choice_value(cf_val)
+                                                        ):
                                                             non_exempt_changes = True
                                                             msg = f"Nested custom field '{cf_key}' changed (old: {current_cf_val}, new: {cf_val})"
                                                             block_reasons.append(msg)
@@ -473,15 +577,34 @@ class NetboxBranchGuardMiddleware:
                                                     break
                                             else:
                                                 # Standard database field or Many-to-Many field
-                                                if field.name.lower() in self.excluded_fields or getattr(field, 'attname', '').lower() in self.excluded_fields:
+                                                if (
+                                                    field.name.lower()
+                                                    in self.excluded_fields
+                                                    or getattr(
+                                                        field, "attname", ""
+                                                    ).lower()
+                                                    in self.excluded_fields
+                                                    or field_name.lower()
+                                                    in self.excluded_fields
+                                                ):
                                                     continue
-                                                
+
                                                 for obj in objs:
-                                                    if _is_field_changed(obj, field, val):
+                                                    if _is_field_changed(
+                                                        obj, field, val
+                                                    ):
                                                         non_exempt_changes = True
-                                                        attname = getattr(field, 'attname', field.name)
-                                                        current_val = getattr(obj, attname, getattr(obj, field.name, None))
-                                                        if hasattr(current_val, 'pk'):
+                                                        attname = getattr(
+                                                            field, "attname", field.name
+                                                        )
+                                                        current_val = getattr(
+                                                            obj,
+                                                            attname,
+                                                            getattr(
+                                                                obj, field.name, None
+                                                            ),
+                                                        )
+                                                        if hasattr(current_val, "pk"):
                                                             current_val = current_val.pk
                                                         msg = f"Field '{field.name}' changed (old: {current_val}, new: {val})"
                                                         block_reasons.append(msg)
@@ -505,25 +628,30 @@ class NetboxBranchGuardMiddleware:
                     return self.get_response(request)
 
                 # Format blocking message with reasons
-                reason_str = "; ".join(block_reasons) if block_reasons else "restricted write operation"
+                reason_str = (
+                    "; ".join(block_reasons)
+                    if block_reasons
+                    else "restricted write operation"
+                )
                 display_msg = f"Writes to the Main branch are restricted ({reason_str})"
 
                 if request.path.startswith("/api/"):
                     # Block writes to Main by the /api/
                     log.warning(
                         f"[BranchGuard BLOCK] Blocking writes to Main. Reason: {reason_str}",
-                        display_msg
+                        display_msg,
                     )
-                else:
-                    # Block writes to Main in the UI
-                    log.warning(
-                        f"[BranchGuard BLOCK] Blocking writes to Main. Reason: {reason_str}",
-                        display_msg
-                    )
+                    # NetBox 4.7 API consumers expect a structured error, not a redirect
+                    return JsonResponse({"detail": display_msg}, status=403)
+
+                # Block writes to Main in the UI
+                log.warning(
+                    f"[BranchGuard BLOCK] Blocking writes to Main. Reason: {reason_str}",
+                    display_msg,
+                )
 
                 # Redirect the user back to the previous page
                 return redirect(request.META.get("HTTP_REFERER", "/"))
-
 
             # Lazy import
             try:
@@ -535,13 +663,12 @@ class NetboxBranchGuardMiddleware:
                 # Redirect the user back to the previous page
                 return redirect(request.META.get("HTTP_REFERER", "/"))
 
-
             # Validate branch
             try:
                 branch = Branch.objects.get(schema_id=branch_id)
 
             except Branch.DoesNotExist:
-                log.error(f"[BranchGuard ERROR] Invalid branch")
+                log.error("[BranchGuard ERROR] Invalid branch")
 
                 # Redirect the user back to the previous page
                 return redirect(request.META.get("HTTP_REFERER", "/"))
@@ -552,35 +679,45 @@ class NetboxBranchGuardMiddleware:
                 # Redirect the user back to the previous page
                 return redirect(request.META.get("HTTP_REFERER", "/"))
 
-
             # Check for allowed branches
             if self.group_branch_map:
                 allowed_branch_patterns = []
 
                 for group_pattern, branch_patterns in self.group_branch_map.items():
-                    if any(fnmatch.fnmatch(user_group, group_pattern) for user_group in user_groups):
+                    if any(
+                        fnmatch.fnmatch(user_group, group_pattern)
+                        for user_group in user_groups
+                    ):
                         allowed_branch_patterns.extend(branch_patterns)
 
                 if not allowed_branch_patterns:
-                    log.warning(f"[BranchGuard BLOCK] You are not assigned to a branch group")
+                    log.warning(
+                        "[BranchGuard BLOCK] You are not assigned to a branch group"
+                    )
 
                     # Redirect the user back to the previous page
                     return redirect(request.META.get("HTTP_REFERER", "/"))
 
-                if not any(fnmatch.fnmatch(branch.name, pattern) for pattern in allowed_branch_patterns):
-                    log.warning(f'[BranchGuard BLOCK] You cannot use branch "{branch.name}"')
-                    log.warning(f"[BranchGuard BLOCK] Only: {', '.join('"' + b +'"' for b in allowed_branch_patterns)}")
+                if not any(
+                    fnmatch.fnmatch(branch.name, pattern)
+                    for pattern in allowed_branch_patterns
+                ):
+                    log.warning(
+                        f'[BranchGuard BLOCK] You cannot use branch "{branch.name}"'
+                    )
+                    log.warning(
+                        f"[BranchGuard BLOCK] Only: {', '.join('"' + b + '"' for b in allowed_branch_patterns)}"
+                    )
 
                     # Redirect the user back to the previous page
                     return redirect(request.META.get("HTTP_REFERER", "/"))
-
 
             # Ownership enforcement
             if self.enforce_ownership and branch.owner != request.user:
                 log.warning(
                     f"[BranchGuard BLOCK] user={request.user}, "
                     f"branch_owner={branch.owner}, branch={branch_id} -> Not Branch Owner",
-                    f"You can only modify a branch you own"
+                    "You can only modify a branch you own",
                 )
 
                 # Redirect the user back to the previous page
@@ -589,9 +726,7 @@ class NetboxBranchGuardMiddleware:
             log.success(
                 f"[BranchGuard ALLOW] user={request.user}, "
                 f"{request.method}, {request.path}, branch={branch_id}",
-                f""
             )
-
 
         except Exception as e:
             log.error(f"[BranchGuard ERROR] {e}")
@@ -599,6 +734,4 @@ class NetboxBranchGuardMiddleware:
             # Redirect the user back to the previous page
             return redirect(request.META.get("HTTP_REFERER", "/"))
 
-
         return self.get_response(request)
-

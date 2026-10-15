@@ -27,7 +27,7 @@ classifiers = [
 	"Intended Audience :: System Administrators",
 ]
 dependencies = [
-	"django>=4.2",
+	"django>=6.1",
 ]
 requires-python = ">=3.12"
 

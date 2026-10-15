@@ -1,6 +1,4 @@
 from netbox.plugins import PluginConfig
-from django.conf import settings
-from importlib.metadata import version, PackageNotFoundError
 
 try:
     from ._version import __version__
@@ -19,46 +17,33 @@ class NetboxBranchGuardConfig(PluginConfig):
 
     base_url = "branch-guard"
 
-    min_version = "4.6.0"
-    max_version = "4.6.99"
+    min_version = "4.7.0"
+    max_version = "4.7.99"
 
-    middleware = (
-        "netbox_branch_guard.middleware.NetboxBranchGuardMiddleware",
-    )
+    middleware = ("netbox_branch_guard.middleware.NetboxBranchGuardMiddleware",)
 
     default_settings = {
         # plugin is enabled.
         "enabled": True,
-
         # API can write to Main.
         "api_bypass": True,
-
         # Superuser can write to Main.
         "superuser_bypass": True,
-
         # Users can only write to branches they own.
         "enforce_ownership": True,
-
         # Output detailed logging to the netbox log.
         "logging": False,
-
         # Valid levels are "debug", "info", "success", "warning", "error"
         "log_level": "debug",
-
         # Map user groups to their allowed branches
         "group_branch_map": {},
-
         # Entire models that are safe to modify directly on main
         "excluded_models": [],
-
         # Specific fields allowed to be updated on any object directly on main
         "excluded_fields": [],
-
         # Map views to models where the view isn't directly associated with a model
         "view_model_map": {},
     }
-
-
 
     def ready(self):
         super().ready()
